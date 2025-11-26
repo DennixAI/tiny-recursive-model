@@ -52,7 +52,6 @@ class TinyRecursiveModel(Module):
 
         self.to_pred = nn.Linear(dim, num_tokens, bias = False)
 
-        # UPGRADE: Faster native reduction
         self.to_halt_pred = nn.Sequential(
             nn.Linear(dim, 1, bias = False),
             nn.Sigmoid()
@@ -155,7 +154,10 @@ class TinyRecursiveModel(Module):
                 break
 
         preds = cat(preds).argmax(dim = -1)
-        exited_step_indices = tensor(exited_step_indices)
+        
+        # FIX: Ensure tensor is created on the correct device
+        exited_step_indices = tensor(exited_step_indices, device=self.device)
+        
         exited_batch_indices = cat(exited_batch_indices)
         
         sort_indices = exited_batch_indices.argsort(dim = -1)

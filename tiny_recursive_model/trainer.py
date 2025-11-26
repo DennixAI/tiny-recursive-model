@@ -55,7 +55,7 @@ class Trainer(Module):
         switch_ema_every = 10000,
         accelerate_kwargs: dict = dict(),
         cpu = False,
-        compile_model = True  # NEW: Option to compile
+        compile_model = True 
     ):
         super().__init__()
 
@@ -64,14 +64,14 @@ class Trainer(Module):
         self.batch_size = batch_size
         self.epochs = epochs
 
-        # data - UPGRADE: Optimized DataLoader
+        # data
         self.dataset = dataset
         self.dataloader = DataLoader(
             self.dataset,
             batch_size = self.batch_size,
             shuffle = True,
-            num_workers = 4 if not cpu else 0, # Parallel loading
-            pin_memory = True if not cpu else False, # Faster host-to-device transfer
+            num_workers = 4 if not cpu else 0,
+            pin_memory = True if not cpu else False,
             prefetch_factor = 2 if not cpu else None
         )
 
@@ -120,10 +120,14 @@ class Trainer(Module):
         self.halt_prob_thres = halt_prob_thres
         self.max_recurrent_steps = max_recurrent_steps
 
-        # UPGRADE: Torch Compile
+        # UPGRADE: Torch Compile logic fixed
         if compile_model and not cpu and hasattr(torch, "compile"):
-            self.accelerator.print("Compiling model with torch.compile (mode='reduce-overhead')...")
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+            # FIX: Switched from "reduce-overhead" to "default".
+            # "reduce-overhead" uses CUDAGraphs which crash on recursive loops 
+            # where outputs are fed back as inputs (memory overwrite).
+            # "default" still provides kernel fusion (Triton) speedups without the crash.
+            self.accelerator.print("Compiling model with torch.compile (mode='default')...")
+            self.model = torch.compile(self.model, mode="default")
 
         # prepare maybe distributed
         self.model, self.optim, self.dataloader, self.scheduler = self.accelerator.prepare(
@@ -136,43 +140,30 @@ class Trainer(Module):
 
             for dataset_input, dataset_output in self.dataloader:
                 
-                # Zero grad at start of BATCH, not start of step
                 self.optim.zero_grad()
 
                 outputs, latents = self.model.get_initial()
                 
-                total_steps_run = 0
-
+                # We need to tell the compiler that a new step is beginning if we were using CUDAGraphs,
+                # but with mode="default", this loop is safe.
                 for recurrent_step in range_from_one(self.max_recurrent_steps):
-                    
-                    # UPGRADE: Logic Flow
-                    # We run forward, calculate loss, and backward.
-                    # We DO NOT step the optimizer here. We accumulate gradients.
-                    # This simulates BPTT and is much faster (less optimizer overhead).
                     
                     loss, (main_loss, halt_loss), outputs, latents, pred, halt = self.model(
                         dataset_input, outputs, latents, labels = dataset_output
                     )
 
-                    # Normalize loss by number of steps to keep gradient magnitude stable
-                    # This replaces the need to scale LR manually for steps
                     scaled_loss = loss / self.max_recurrent_steps
 
                     self.accelerator.backward(scaled_loss)
                     
-                    # Logging (only occasionally to save time)
                     if recurrent_step % 4 == 0 or recurrent_step == self.max_recurrent_steps:
                         self.accelerator.print(f'[{epoch} ({recurrent_step} / {self.max_recurrent_steps})] loss: {main_loss.mean().item():.3f} | halt loss: {halt_loss.mean().item():.3f}')
 
-                    # Handle halting logic
                     halt_mask = halt >= self.halt_prob_thres
 
                     if not halt_mask.any():
                         continue
                     
-                    # If halting, we must filter items. 
-                    # NOTE: This breaks the "static graph" for compilation slightly, 
-                    # but is necessary for the logic.
                     outputs = outputs[~halt_mask]
                     latents = latents[~halt_mask]
                     dataset_input = dataset_input[~halt_mask]
@@ -181,7 +172,6 @@ class Trainer(Module):
                     if is_empty(outputs):
                         break
                 
-                # UPGRADE: Step Optimizer once per batch (Gradient Accumulation)
                 self.optim.step()
                 self.scheduler.step()
 
